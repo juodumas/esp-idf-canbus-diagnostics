@@ -32,12 +32,24 @@
 #include "esp_log.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
+#include "driver/gpio.h"
+
+#ifndef CAN_TX
+#  define CAN_TX 21
+#endif
+#ifndef CAN_RX
+#  define CAN_RX 20
+#endif
+#ifndef BTN_SEND
+#  define BTN_SEND 9
+#endif
 
 static const char *TAG = "cantest";
 
 /* ---- Pins -------------------------------------- */
-static constexpr gpio_num_t CAN_TX = GPIO_NUM_21;
-static constexpr gpio_num_t CAN_RX = GPIO_NUM_20;
+static constexpr gpio_num_t CAN_TX_GPIO  = (gpio_num_t)CAN_TX;
+static constexpr gpio_num_t CAN_RX_GPIO  = (gpio_num_t)CAN_RX;
+static constexpr gpio_num_t BTN_SEND_GPIO = (gpio_num_t)BTN_SEND;
 
 /* ---- Bitrates to cycle with 'b' --------------------------------------- */
 static const uint32_t bitrates[] = {10000, 25000, 50000, 125000, 250000, 500000, 1000000};
@@ -122,8 +134,8 @@ static void node_create(void)
     node_destroy();
 
     twai_onchip_node_config_t cfg{};
-    cfg.io_cfg.tx = CAN_TX;
-    cfg.io_cfg.rx = CAN_RX;
+    cfg.io_cfg.tx = CAN_TX_GPIO;
+    cfg.io_cfg.rx = CAN_RX_GPIO;
     cfg.io_cfg.quanta_clk_out    = (gpio_num_t)-1;
     cfg.io_cfg.bus_off_indicator = (gpio_num_t)-1;
     cfg.bit_timing.bitrate   = bitrates[cur_bitrate_idx];
@@ -157,7 +169,7 @@ static void node_create(void)
     if (err != ESP_OK) { ESP_LOGE(TAG, "twai_node_enable: %d (%s)", err, esp_err_to_name(err)); }
 
     ESP_LOGI(TAG, "TWAI node up @ %lu bps  mode=%s  tx=%d rx=%d  fail_retry=0",
-             (unsigned long)bitrates[cur_bitrate_idx], mode_names[cur_mode], (int)CAN_TX, (int)CAN_RX);
+             (unsigned long)bitrates[cur_bitrate_idx], mode_names[cur_mode], (int)CAN_TX_GPIO, (int)CAN_RX_GPIO);
 }
 
 /* ---- Commands --------------------------------------------------------- */
@@ -244,6 +256,52 @@ static void monitor_task(void *)
     }
 }
 
+/* ---- Send button (BTN_SEND) ------------------------------------------ */
+/* Pull-up input, button shorts to GND -> active low.
+ * Send one frame per button-down (edge triggered, debounced).
+ * Does the same thing as pressing 's' on the CLI.
+ */
+static void btn_task(void *)
+{
+    gpio_config_t io{};
+    io.pin_bit_mask = 1ULL << BTN_SEND_GPIO;
+    io.mode         = GPIO_MODE_INPUT;
+    io.pull_up_en   = GPIO_PULLUP_ENABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type    = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&io));
+
+    const int DEBOUNCE_MS = 20;
+    bool pressed  = false;   // current debounced state (true = button down)
+    bool armed    = false;   // a down-edge has occurred and not yet been "used"
+
+    while (true) {
+        int raw = gpio_get_level(BTN_SEND_GPIO);    // 0 = pressed
+        bool now_pressed = (raw == 0);
+
+        if (now_pressed != pressed) {
+            vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+            if (gpio_get_level(BTN_SEND_GPIO) == (now_pressed ? 0 : 1)) {
+                pressed = now_pressed;
+                if (pressed) {
+                    armed = true;  // a fresh button-down edge
+                }
+            }
+            continue;
+        }
+
+        if (armed) {
+            /* Fire exactly once per button-down. Hold-to-repeat is NOT done
+             * on purpose: this mirrors a single keypress of 's'. */
+            ESP_LOGI(TAG, "BTN_SEND pressed -> sending test frame");
+            cmd_send(true);
+            armed = false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 /* ---- CLI ------------------------------------------------------------- */
 static void print_help(void)
 {
@@ -255,6 +313,7 @@ static void print_help(void)
     printf("  S   send frame     id=0x00F data=        (DLC=0)\n");
     printf("  i   print status   (state/TEC/REC/bus_err)\n");
     printf("  ?   help\n");
+    printf("\n  BTN_SEND (GPIO%d) short-to-GND == one 's' press per push\n", BTN_SEND);
 }
 
 extern "C" void app_main(void)
@@ -263,6 +322,7 @@ extern "C" void app_main(void)
     evt_queue = xQueueCreate(32, sizeof(evt_t));
     configASSERT(evt_queue);
     xTaskCreate(monitor_task, "mon", 4096, nullptr, 5, nullptr);
+    xTaskCreate(btn_task,     "btn", 3072, nullptr, 5, nullptr);
     node_create();
     print_help();
 

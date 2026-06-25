@@ -12,7 +12,10 @@ Default Pins (can be modified in `platformio.ini`:
 
 Default bitrate on boot: **1 mbps**.
 
-No frame is sent until you press `s`, `S` or the `BTN_SEND` button.
+No frame is sent until you press `s`, `S` or the `BTN_SEND` button
+(GPIO9, active-low / short-to-GND, internal pull-up enabled).
+One `s`-equivalent frame is sent per button-down (edge-triggered, debounced;
+hold-to-repeat is intentionally NOT done).
 
 ## Build / flash / monitor
 
