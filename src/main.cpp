@@ -30,6 +30,7 @@
 #include "freertos/queue.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 #include "driver/gpio.h"
@@ -50,6 +51,17 @@ static const char *TAG = "cantest";
 static constexpr gpio_num_t CAN_TX_GPIO  = (gpio_num_t)CAN_TX;
 static constexpr gpio_num_t CAN_RX_GPIO  = (gpio_num_t)CAN_RX;
 static constexpr gpio_num_t BTN_SEND_GPIO = (gpio_num_t)BTN_SEND;
+
+/* ---- Throughput-test frames ------------------------------------------ *
+ * ID 0x7E0 + 8-byte payload [seq LE32][0x55 0xAA 0x55 0xAA].
+ * Sender: hold BTN_SEND >500ms (or press 't') -> flood this frame.
+ * Receivers: on first 0x7E0 frame, start counting; 500ms of silence ends
+ * the test and prints a one-line summary. No handshake, scales to N nodes.
+ */
+static constexpr uint32_t TP_ID            = 0x7E0;
+static constexpr uint32_t TP_HOLD_MS       = 500;    // sender hold threshold
+static constexpr uint32_t TP_SILENCE_MS    = 500;    // receiver end-of-test
+static const uint8_t TP_PATTERN[4]         = { 0x55, 0xAA, 0x55, 0xAA };
 
 /* ---- Bitrates to cycle with 'b' --------------------------------------- */
 static const uint32_t bitrates[] = {10000, 25000, 50000, 125000, 250000, 500000, 1000000};
@@ -192,6 +204,95 @@ static void cmd_send(bool with_data)
              f.header.id, f.header.dlc, err, esp_err_to_name(err));
 }
 
+/* ---- Throughput-test sender ------------------------------------------ */
+static volatile bool tp_active = false;   // true while flooding
+
+static void tp_send(uint32_t seq)
+{
+    if (!node) return;
+    uint8_t buf[8];
+    buf[0] = (uint8_t)(seq);
+    buf[1] = (uint8_t)(seq >> 8);
+    buf[2] = (uint8_t)(seq >> 16);
+    buf[3] = (uint8_t)(seq >> 24);
+    memcpy(buf + 4, TP_PATTERN, 4);
+    twai_frame_t f{};
+    f.header.id  = TP_ID;
+    f.header.dlc = 8;
+    f.buffer     = buf;
+    f.buffer_len = 8;
+    (void)twai_node_transmit(node, &f, 0);   // non-blocking; drop if queue full
+}
+
+/* ---- Throughput-test receiver (runs inside monitor_task) -------------- */
+struct tp_stats_t {
+    bool      active;
+    int64_t   start_us;
+    int64_t   last_rx_us;
+    uint32_t  frames;
+    uint32_t  last_seq;
+    bool      last_seq_valid;
+    uint32_t  lost;       // sum of seq gaps
+    uint32_t  corrupt;    // pattern mismatch
+    uint32_t  first_seq;  // for expected total
+};
+static tp_stats_t tp_rx;
+
+static void tp_rx_start(uint32_t seq0)
+{
+    tp_rx.active        = true;
+    tp_rx.start_us      = esp_timer_get_time();
+    tp_rx.last_rx_us    = tp_rx.start_us;
+    tp_rx.frames        = 1;
+    tp_rx.last_seq      = seq0;
+    tp_rx.last_seq_valid= true;
+    tp_rx.lost          = 0;
+    tp_rx.corrupt       = 0;
+    tp_rx.first_seq     = seq0;
+    ESP_LOGI(TAG, "TP RX: throughput test started (first seq=%u)", (unsigned)seq0);
+}
+
+static void tp_rx_frame(const uint8_t *data, uint16_t dlc)
+{
+    if (dlc < 8) { tp_rx.corrupt++; return; }   // short frame = corrupt
+    uint32_t seq = (uint32_t)data[0] | ((uint32_t)data[1] << 8)
+                 | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+    if (memcmp(data + 4, TP_PATTERN, 4) != 0) { tp_rx.corrupt++; }
+    if (!tp_rx.active) { tp_rx_start(seq); return; }
+    tp_rx.frames++;
+    if (tp_rx.last_seq_valid && seq != tp_rx.last_seq + 1) {
+        // gap (handles wrap because unsigned arithmetic)
+        uint32_t gap = seq - tp_rx.last_seq - 1;
+        tp_rx.lost += gap;
+    }
+    tp_rx.last_seq       = seq;
+    tp_rx.last_rx_us     = esp_timer_get_time();
+}
+
+static void tp_rx_finish(void)
+{
+    if (!tp_rx.active) return;
+    tp_rx.active = false;
+    int64_t elapsed_us = tp_rx.last_rx_us - tp_rx.start_us;
+    double   elapsed_s = elapsed_us / 1000000.0;
+    uint32_t expected  = tp_rx.frames + tp_rx.lost;
+    double   pct_lost  = expected ? (100.0 * tp_rx.lost / expected) : 0.0;
+    double   fps       = elapsed_s > 0 ? tp_rx.frames / elapsed_s : 0;
+    // classic 11-bit 8-byte data frame: ~111 bits on the wire (incl. stuff
+    // estimate). throughput_kbps = fps * 111 / 1000. Use a conservative 130
+    // bits/frame for stuffed worst-case so the number is comparable to the
+    // configured bitrate.
+    const double BITS_PER_FRAME = 130.0;
+    double       actual_kbps    = fps * BITS_PER_FRAME / 1000.0;
+    uint32_t     configured     = bitrates[cur_bitrate_idx] / 1000;
+
+    ESP_LOGI(TAG,
+        "TP RX: frames=%u/%u (%.1f%% lost/%u corrupt) time=%.2fs rate=%.0ffps throughput=%.0f/%lukbps",
+        (unsigned)tp_rx.frames, (unsigned)expected, pct_lost,
+        (unsigned)tp_rx.corrupt, elapsed_s, fps,
+        actual_kbps, (unsigned long)configured);
+}
+
 static const char *state_name(uint32_t s)
 {
     switch (s) {
@@ -232,18 +333,37 @@ static void monitor_task(void *)
 {
     evt_t ev;
     while (true) {
-        if (xQueueReceive(evt_queue, &ev, portMAX_DELAY) != pdPASS) continue;
+        /* While listening for a throughput test, poll for silence so we can
+         * print the summary without waiting for another event. Otherwise
+         * block indefinitely on the queue (normal idle behaviour). */
+        TickType_t wait = (tp_rx.active) ? pdMS_TO_TICKS(50) : portMAX_DELAY;
+        if (xQueueReceive(evt_queue, &ev, wait) != pdPASS) {
+            // timeout: check throughput-test silence
+            if (tp_rx.active &&
+                (esp_timer_get_time() - tp_rx.last_rx_us) > (int64_t)TP_SILENCE_MS * 1000) {
+                tp_rx_finish();
+            }
+            continue;
+        }
         switch (ev.kind) {
             case evt_t::TX:
-                if (ev.tx.success) ESP_LOGI(TAG, "CB TX done: SUCCESS (frame was ACKed)");
-                else               ESP_LOGE(TAG, "CB TX done: FAILED (no ACK / bus-off)");
+                if (ev.tx.success) {
+                    if (!tp_active)   // suppress per-frame log while flooding
+                        ESP_LOGI(TAG, "CB TX done: SUCCESS (frame was ACKed)");
+                } else {
+                    ESP_LOGE(TAG, "CB TX done: FAILED (no ACK / bus-off)");
+                }
                 break;
             case evt_t::RX:
-                ESP_LOGI(TAG, "CB RX id=0x%03X ide=%u rtr=%u dlc=%u  data=",
-                         ev.rx.id, ev.rx.ide, ev.rx.rtr, ev.rx.dlc);
-                printf("     ");
-                for (int i = 0; i < ev.rx.dlc && i < 8; i++) printf("%02X ", ev.rx.data[i]);
-                printf("\n");
+                if (ev.rx.id == TP_ID) {
+                    tp_rx_frame(ev.rx.data, ev.rx.dlc);
+                } else {
+                    ESP_LOGI(TAG, "CB RX id=0x%03X ide=%u rtr=%u dlc=%u  data=",
+                             ev.rx.id, ev.rx.ide, ev.rx.rtr, ev.rx.dlc);
+                    printf("     ");
+                    for (int i = 0; i < ev.rx.dlc && i < 8; i++) printf("%02X ", ev.rx.data[i]);
+                    printf("\n");
+                }
                 break;
             case evt_t::STATE:
                 ESP_LOGW(TAG, "CB state: %s -> %s", state_name(ev.st.old_s), state_name(ev.st.new_s));
@@ -256,10 +376,12 @@ static void monitor_task(void *)
     }
 }
 
-/* ---- Send button (BTN_SEND) ------------------------------------------ */
-/* Pull-up input, button shorts to GND -> active low.
- * Send one frame per button-down (edge triggered, debounced).
- * Does the same thing as pressing 's' on the CLI.
+/* ---- Send button (BTN_SEND) ------------------------------------------ *
+ * Pull-up input, button shorts to GND -> active low.
+ *  - short press: one 's' frame  (id=0x00F data=AB CD)
+ *  - hold > TP_HOLD_MS: throughput flood  (id=TP_ID, 8 bytes, seq counter)
+ *    stops on release. Hold-to-repeat is intentionally only the throughput
+ *    test; normal 's' stays single-shot.
  */
 static void btn_task(void *)
 {
@@ -271,34 +393,63 @@ static void btn_task(void *)
     io.intr_type    = GPIO_INTR_DISABLE;
     ESP_ERROR_CHECK(gpio_config(&io));
 
-    const int DEBOUNCE_MS = 20;
-    bool pressed  = false;   // current debounced state (true = button down)
-    bool armed    = false;   // a down-edge has occurred and not yet been "used"
+    const int  DEBOUNCE_MS = 20;
+    const int  POLL_MS     = 10;
+    bool       pressed     = false;  // debounced state
+    bool       armed       = false;  // one 's' pending
+    int64_t    down_us     = 0;      // when current press started
+    bool       tp_mode     = false;  // currently flooding
+    uint32_t   tp_seq      = 0;
 
     while (true) {
-        int raw = gpio_get_level(BTN_SEND_GPIO);    // 0 = pressed
-        bool now_pressed = (raw == 0);
+        int  raw        = gpio_get_level(BTN_SEND_GPIO);
+        bool now_pressed= (raw == 0);
 
+        /* --- edge / debounce --- */
         if (now_pressed != pressed) {
             vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
             if (gpio_get_level(BTN_SEND_GPIO) == (now_pressed ? 0 : 1)) {
                 pressed = now_pressed;
                 if (pressed) {
-                    armed = true;  // a fresh button-down edge
+                    armed   = true;
+                    down_us = esp_timer_get_time();
+                } else {
+                    /* release: stop throughput flood if active */
+                    if (tp_mode) {
+                        tp_active = false;
+                        tp_mode   = false;
+                        ESP_LOGI(TAG, "TP TX: stopped after %u frames", (unsigned)tp_seq);
+                    }
                 }
             }
             continue;
         }
 
+        /* --- held: promote to throughput mode after threshold --- */
+        if (pressed && !tp_mode && armed) {
+            int64_t held_ms = (esp_timer_get_time() - down_us) / 1000;
+            if (held_ms >= (int64_t)TP_HOLD_MS) {
+                /* cancel the pending single-shot; switch to flood */
+                armed   = false;
+                tp_mode = true;
+                tp_seq  = 0;
+                tp_active = true;
+                ESP_LOGI(TAG, "TP TX: throughput test start (held %lldms)", (long long)held_ms);
+            }
+        }
+
+        /* --- actions --- */
         if (armed) {
-            /* Fire exactly once per button-down. Hold-to-repeat is NOT done
-             * on purpose: this mirrors a single keypress of 's'. */
             ESP_LOGI(TAG, "BTN_SEND pressed -> sending test frame");
             cmd_send(true);
             armed = false;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        if (tp_mode) {
+            tp_send(tp_seq++);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
 }
 
@@ -312,8 +463,10 @@ static void print_help(void)
     printf("  s   send frame     id=0x00F data=AB CD   (DLC=2)\n");
     printf("  S   send frame     id=0x00F data=        (DLC=0)\n");
     printf("  i   print status   (state/TEC/REC/bus_err)\n");
+    printf("  t   throughput test: flood id=0x7E0 for 2s (CLI)\n");
     printf("  ?   help\n");
-    printf("\n  BTN_SEND (GPIO%d) short-to-GND == one 's' press per push\n", BTN_SEND);
+    printf("\n  BTN_SEND (GPIO%d): short press == one 's'; hold >%ums == throughput flood (release to stop)\n",
+           BTN_SEND, (unsigned)TP_HOLD_MS);
 }
 
 extern "C" void app_main(void)
@@ -341,7 +494,26 @@ extern "C" void app_main(void)
                 print_help();
                 break;
             case 'S': cmd_send(false);  break;
-            case 's': cmd_send(true);  break;
+            case 's': cmd_send(true);   break;
+            case 't': case 'T': {
+                /* time-limited throughput flood from CLI (button-free).
+                 * Runs for 2s, then stops. getchar() is blocking so we
+                 * can't poll for a stop key; use the button if you want
+                 * release-to-stop. */
+                const int64_t DURATION_MS = 2000;
+                ESP_LOGI(TAG, "TP TX: CLI throughput test start (%lldms)",
+                         (long long)DURATION_MS);
+                tp_active = true;
+                uint32_t seq = 0;
+                int64_t end_us = esp_timer_get_time() + DURATION_MS * 1000;
+                while (esp_timer_get_time() < end_us) {
+                    tp_send(seq++);
+                    taskYIELD();
+                }
+                tp_active = false;
+                ESP_LOGI(TAG, "TP TX: stopped after %u frames", (unsigned)seq);
+                break;
+            }
             case 'i': case 'I': cmd_info();  break;
             case '?': case 'h': case 'H': print_help(); break;
             case '\r': case '\n': case ' ': break;

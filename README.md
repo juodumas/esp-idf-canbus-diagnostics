@@ -12,10 +12,13 @@ Default Pins (can be modified in `platformio.ini`:
 
 Default bitrate on boot: **1 mbps**.
 
-No frame is sent until you press `s`, `S` or the `BTN_SEND` button
-(GPIO9, active-low / short-to-GND, internal pull-up enabled).
-One `s`-equivalent frame is sent per button-down (edge-triggered, debounced;
-hold-to-repeat is intentionally NOT done).
+No frame is sent until you press `s`, `S` when connected via serial, or the
+`BTN_SEND` button (GPIO9, active-low / short-to-GND, internal pull-up enabled).
+
+A short press of `BTN_SEND` sends one `s`-equivalent frame (edge-triggered,
+debounced). Holding `BTN_SEND` for more than 500 ms enters throughput-flood
+mode (id=0x7E0, 8-byte payload: little-endian 32-bit sequence counter followed
+by the fixed pattern `55 AA 55 AA`); release the button to stop.
 
 ## Build / flash / monitor
 
@@ -25,9 +28,9 @@ pio run -t upload
 pio device monitor
 ```
 
-Console runs over USB-Serial-JTAG (single USB cable, see `sdkconfig.defaults`).
-
 ## CLI
+
+Console runs over USB-Serial-JTAG (single USB cable, see `sdkconfig.defaults`).
 
 | Key | Action |
 |-----|--------|
@@ -35,6 +38,7 @@ Console runs over USB-Serial-JTAG (single USB cable, see `sdkconfig.defaults`).
 | `m` | cycle mode     normal -> listen-only -> loopback -> self-test (re-creates) |
 | `s` | send one frame: id=0x00F, data=AB CD (DLC=2) |
 | `S` | send one frame: id=0x00F, data= (DLC=0, empty data frame) |
+| `t` | throughput test: flood id=0x7E0 (8-byte, seq+pattern) for 2s |
 | `i` | print status snapshot (error state, TEC, REC, bus_err_num) |
 | `?` | help |
 
@@ -45,6 +49,21 @@ E (1234) cantest: CB TX done: FAILED (no ACK / bus-off)
 E (1234) cantest: CB error flags=0x10
 E (1234) cantest:   ack_err   -> NO ACK (other node didn't hear/ACK)
 ```
+
+## Throughput test
+
+`id=0x7E0` frames are recognised by every node automatically — no handshake.
+On receiving the first `0x7E0` frame a listener starts counting frames,
+tracking sequence gaps (lost frames) and pattern mismatches (corrupt frames);
+after 500 ms of silence it prints a one-line summary:
+
+```
+TP RX: frames=1234/1240 (0.5% lost/0 corrupt) time=2.10s rate=588fps throughput=76/1000kbps
+```
+
+This scales to N listeners with no extra coordination: each prints its own
+summary, so cross-checking them reveals whether loss is link-specific or
+bus-wide. Only one sender should flood at a time. 
 
 ## How to use it to find faults
 
