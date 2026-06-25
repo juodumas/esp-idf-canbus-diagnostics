@@ -1,25 +1,18 @@
 # canbus-diag
 
-Minimal pure-ESP-IDF TWAI diagnostic tool for the ESP32-C3, built with
-PlatformIO. Used to hunt down the
+Minimal pure-ESP-IDF TWAI diagnostic tool for the ESP32-C3, built with PlatformIO.
 
-```
-[canbus:054]: send to standard id=0x00f failed with error 2!
-```
+Default Pins (can be modified in `platformio.ini`:
 
-failure on a 2-node CAN bus where the CAN LED stays on and no ACK seems to
-come back.
+| Signal   | GPIO |
+|--------- |------|
+| CAN TX   | 21   |
+| CAN RX   | 20   |
+| SEND BTN |  9   |
 
-Pins (taken from `worm-relay.yaml`; this is an independent app, none of the
-worm-relay code is reused):
+Default bitrate on boot: **1 mbps**.
 
-| Signal | GPIO |
-|--------|------|
-| CAN TX | 21   |
-| CAN RX | 20   |
-
-Default bitrate on boot: **125 kbps** (matches the YAML). No frame is sent
-until you press `s`.
+No frame is sent until you press `s`, `S` or the `BTN_SEND` button.
 
 ## Build / flash / monitor
 
@@ -37,12 +30,12 @@ Console runs over USB-Serial-JTAG (single USB cable, see `sdkconfig.defaults`).
 |-----|--------|
 | `b` | cycle bitrate  125 -> 250 -> 500 -> 1000 kbps (re-creates the node) |
 | `m` | cycle mode     normal -> listen-only -> loopback -> self-test (re-creates) |
-| `s` | send one frame: id=0x00F, data=AB CD |
+| `s` | send one frame: id=0x00F, data=AB CD (DLC=2) |
+| `S` | send one frame: id=0x00F, data= (DLC=0, empty data frame) |
 | `i` | print status snapshot (error state, TEC, REC, bus_err_num) |
 | `?` | help |
 
-All TWAI events arrive via ISR callbacks and are printed by a monitor task,
-e.g.:
+All TWAI events arrive via ISR callbacks and are printed by a monitor task, e.g.:
 
 ```
 E (1234) cantest: CB TX done: FAILED (no ACK / bus-off)
@@ -50,10 +43,9 @@ E (1234) cantest: CB error flags=0x10
 E (1234) cantest:   ack_err   -> NO ACK (other node didn't hear/ACK)
 ```
 
-## How to use it to find the fault
+## How to use it to find faults
 
-Flash this onto **both** nodes. After boot both should print
-`state=ACTIVE` and (with `i`) `TEC=0 REC=0`.
+Flash this onto all nodes. After boot both should print `state=ACTIVE` and (with `i`) `TEC=0 REC=0`.
 
 1. **Self-test on one node, no bus needed.** Press `m` until it says
    `mode=self-test`, then `s`. You should get `CB TX done: SUCCESS` because
@@ -71,9 +63,6 @@ Flash this onto **both** nodes. After boot both should print
 
 ### Reading the error flags
 
-The `on_error` callback surfaces the actual cause ESPHome's `esp32_can`
-collapses into "error 2":
-
 | flag        | meaning |
 |-------------|---------|
 | `ack_err`   | no other node acknowledged the frame |
@@ -82,15 +71,5 @@ collapses into "error 2":
 | `stuff_err` | bit-stuffing rule violated on the wire |
 | `arb_lost`  | lost arbitration (benign on a busy bus) |
 
-`fail_retry_cnt` is set to 0, so a no-ACK reports `TX done: FAILED`
-immediately instead of retransmitting forever — that infinite retransmit is
-exactly what pins your CAN LED on under ESPHome.
+`fail_retry_cnt` is set to 0, so a no-ACK reports `TX done: FAILED` immediately instead of retransmitting forever.
 
-## Why not just keep using ESPHome's esp32_can
-
-ESPHome's `esp32_can` wraps the legacy `driver/twai.h` and only logs
-`send ... failed with error N`. It discards the alert/flag detail that tells
-ack_err from bit_err from bus-off, and it retransmits forever so a single
-wiring fault looks like a constant error storm with the LED stuck on. This
-tool gives you the raw flags and counters so you can tell them apart in one
-key press.

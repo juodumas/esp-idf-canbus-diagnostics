@@ -1,29 +1,25 @@
 /*
  * canbus-diag  --  minimal ESP32-C3 TWAI diagnostic tool (new esp_twai.h API).
  *
- * Purpose: isolate ACK / electrical problems on a 2-node CAN bus, e.g. the
- * ESPHome symptom
- *   [canbus:054]: send to standard id=0x00f failed with error 2!
- * with the CAN LED stuck on.
+ * Purpose: isolate ACK / electrical problems on a 2-node CAN bus.
  *
- * On boot: installs TWAI at 125 kbps (matches worm-relay.yaml) but does NOT
- * transmit. Press 's' to send one frame.
+ * On boot: installs TWAI but does NOT transmit.
  *
  * All RX/TX-done/state-change/error events come via ISR callbacks and are
  * forwarded to a monitor task through a FreeRTOS queue, because ESP_LOG is
  * not ISR-safe. The error callback exposes ack_err / bit_err / form_err /
- * stuff_err / arb_lost bits -- the real reason ESPHome's "error 2" hides.
+ * stuff_err / arb_lost bits.
  *
  * CLI (over USB-Serial-JTAG, single USB cable):
  *   b  cycle bitrate  (125 -> 250 -> 500 -> 1000 kbps), re-create node
  *   m  cycle mode     (normal -> listen-only -> loopback -> self-test)
  *   s  send test frame id=0x00F  data=AB CD
+ *   S  send test frame id=0x00F  data= (0 bytes, DLC=0)
  *   i  print status (state, TEC, REC, bus_err_num)
  *   ?  help
  *
  * fail_retry_cnt = 0  -> a no-ACK reports TX-done(success=false) immediately,
- * instead of retransmitting forever (which is what pins the CAN LED on under
- * ESPHome's esp32_can).
+ * instead of retransmitting forever.
  */
 
 #include <cstdio>
@@ -39,14 +35,14 @@
 
 static const char *TAG = "cantest";
 
-/* ---- Pins (from worm-relay.yaml) -------------------------------------- */
+/* ---- Pins -------------------------------------- */
 static constexpr gpio_num_t CAN_TX = GPIO_NUM_21;
 static constexpr gpio_num_t CAN_RX = GPIO_NUM_20;
 
 /* ---- Bitrates to cycle with 'b' --------------------------------------- */
 static const uint32_t bitrates[] = {10000, 25000, 50000, 125000, 250000, 500000, 1000000};
 static const int NUM_BITRATES   = sizeof(bitrates) / sizeof(bitrates[0]);
-static int cur_bitrate_idx = 0;          // start at 125kbps
+static int cur_bitrate_idx =  NUM_BITRATES - 1; // start at 1mbps
 
 /* ---- Modes to cycle with 'm' ------------------------------------------ */
 enum mode_t { MODE_NORMAL = 0, MODE_LISTEN_ONLY, MODE_LOOPBACK, MODE_SELF_TEST, MODE_COUNT };
@@ -168,16 +164,17 @@ static void node_create(void)
 static void cmd_send(bool with_data)
 {
     if (!node) { ESP_LOGE(TAG, "node not up"); return; }
-    static uint8_t payload[2] = {};
-    if (with_data) {
-      payload[0] = 0xAB;
-      payload[1] = 0xCD;
-    }
+    // NOTE: the esp_twai HAL treats header.dlc==0 as "unset" and derives the
+    // on-wire DLC from buffer_len (twai_hal_v1.c: final_dlc = dlc ? dlc :
+    // len2dlc(buffer_len)). So to actually send a 0-byte data frame we must
+    // also pass buffer_len=0 (and a null/unused buffer); otherwise the stale
+    // payload bytes leak onto the wire as a 2-byte frame.
+    static uint8_t payload[2] = { 0xAB, 0xCD };  // only read when with_data
     twai_frame_t f{};
-    f.header.id  = 0x00F;            // the ID that was failing in ESPHome
+    f.header.id  = with_data ? 0xFFF : 0x100;
     f.header.dlc = with_data ? 2 : 0;
-    f.buffer     = payload;
-    f.buffer_len = sizeof(payload);
+    f.buffer     = with_data ? payload : nullptr;
+    f.buffer_len = with_data ? sizeof(payload) : 0;
     esp_err_t err = twai_node_transmit(node, &f, 200);
     ESP_LOGI(TAG, "tx id=0x%03X dlc=%u err=%d (%s) -- watch for TX done callback",
              f.header.id, f.header.dlc, err, esp_err_to_name(err));
@@ -254,8 +251,8 @@ static void print_help(void)
     printf("  b   cycle bitrate  (now %lu bps, %d/%d)\n",
            (unsigned long)bitrates[cur_bitrate_idx], cur_bitrate_idx + 1, NUM_BITRATES);
     printf("  m   cycle mode     (now %s)\n", mode_names[cur_mode]);
-    printf("  s   send frame     id=0x00F data=AB CD\n");
-    printf("  S   send frame     id=0x00F data=\n");
+    printf("  s   send frame     id=0x00F data=AB CD   (DLC=2)\n");
+    printf("  S   send frame     id=0x00F data=        (DLC=0)\n");
     printf("  i   print status   (state/TEC/REC/bus_err)\n");
     printf("  ?   help\n");
 }

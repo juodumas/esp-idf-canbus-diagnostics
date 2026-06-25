@@ -1,3 +1,4 @@
 .pio/
+framework-espidf/
 sdkconfig.esp32-c3-devkitm-1
 sdkconfig.old
