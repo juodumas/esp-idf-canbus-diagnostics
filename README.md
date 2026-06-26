@@ -23,7 +23,6 @@ by the fixed pattern `55 AA 55 AA`); release the button to stop.
 ## Build / flash / monitor
 
 ```sh
-cd canbus-diag
 pio run -t upload
 pio device monitor
 ```
